@@ -87,3 +87,10 @@ def eval_matrices(model, test_x, test_y, debug = True):
         # print(confusion_matrix(test_y, pred_y_list))
 
     return stats
+
+
+def eval(model,test_df):
+    
+    test_x = one_hot_features(test_df)
+    test_y = test_df['Active'].to_numpy()
+    stats = eval_matrices(model, test_x, test_y)
