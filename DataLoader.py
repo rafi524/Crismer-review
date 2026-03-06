@@ -1,6 +1,5 @@
-from torch.utils.data import Dataset
-from torch.utils.data import DataLoader
-
+import torch
+from torch.utils.data import Dataset, DataLoader
 class TrainerDataset(Dataset):
     def __init__(self, inputs, targets):
         self.inputs = torch.tensor(inputs, dtype=torch.float32).unsqueeze(1)  # Add channel dimension
