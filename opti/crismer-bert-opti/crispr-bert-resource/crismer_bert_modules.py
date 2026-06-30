@@ -254,12 +254,15 @@ class CRISMER_BERT:
         os.system("{} {} {} {} {} {}".format(offtar_search, sgrna[:20], self.ref_genome, mm, dev, self.proj_t))
         
         if not os.path.exists(temp_out) or os.path.getsize(temp_out) == 0:
-            data_set = pd.DataFrame([['dummy_chr', np.nan, np.nan, target, np.nan, np.nan]])
-        else:
-            try:
-                data_set = pd.read_csv(temp_out, sep="\t", header=None, index_col=None)
-            except pd.errors.EmptyDataError:
-                data_set = pd.DataFrame([['dummy_chr', np.nan, np.nan, target, np.nan, np.nan]])
+            raise RuntimeError(
+                f"Cas-OFFinder produced no output for sgRNA '{sgrna[:20]}' "
+                f"(expected file: {temp_out}). This usually means the Cas-OFFinder "
+                f"search itself failed (check the OpenCL/CUDA device argument '{dev}' "
+                f"and the casoffinder_genome.sh script output above) rather than "
+                f"genuinely finding zero off-target sites."
+            )
+        
+        data_set = pd.read_csv(temp_out, sep="\t", header=None, index_col=None)
                 
         offt = data_set.loc[:, 3].values
         offt = np.array([str(t).upper() for t in offt])
