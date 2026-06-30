@@ -1,6 +1,18 @@
 import os
 import tensorflow as tf
+
+# Prevent TensorFlow from allocating all GPU memory at once.
+# This allows Cas-OFFinder's OpenCL process to coexist on the same GPU
+# in future runs without hitting CL_MEM_OBJECT_ALLOCATION_FAILURE (-4).
+gpus = tf.config.experimental.list_physical_devices('GPU')
+for gpu in gpus:
+    try:
+        tf.config.experimental.set_memory_growth(gpu, True)
+    except RuntimeError as e:
+        print(f"Warning: could not set memory growth on {gpu}: {e}")
+
 os.environ['TF_KERAS'] = '1'
+# ... rest unchanged
 from tensorflow.keras.callbacks import *
 from tensorflow.keras.layers import *
 from tensorflow.keras.models import Model
