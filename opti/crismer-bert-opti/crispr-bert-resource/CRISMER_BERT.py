@@ -27,9 +27,6 @@ def main():
     # Configuration
     parser.add_argument("--scenario", type=str, choices=['ts1', 'ts2', 'ts3'], default='ts1',
                         help="Scenario config: ts1 (mismatch lower), ts2 (mismatch lower), ts3 (bulge upper). Default is ts1.")
-    parser.add_argument("--weights", type=str, default=None, help="Path to fine-tuned model weights (.h5)")
-    parser.add_argument("--scaler", type=str, default=None, help="Path to MinMaxScaler (.pkl)")
-    parser.add_argument("--bin_weights", type=str, default=None, help="Path to bin weights (.pkl)")
     
     # Output Settings
     parser.add_argument('--out', type=str, default='default', help="Output file name/path")
@@ -46,13 +43,9 @@ def main():
     parser.add_argument('--threshold', type=float, default=0.76, help="CRISMER-Score threshold for mutated sgRNAs (default: 0.76)")
     
     args = parser.parse_args()
-    
     # Instantiating CRISMER_BERT
     crismer = CRISMER_BERT(
         scenario=args.scenario,
-        weights_path=args.weights,
-        bins_weights_path=args.bin_weights,
-        scaler_path=args.scaler,
         opti_th=args.threshold,
         ref_genome=args.genome
     )

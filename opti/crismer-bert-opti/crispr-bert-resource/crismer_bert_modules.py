@@ -9,10 +9,76 @@ if pwd not in sys.path:
     sys.path.append(pwd)
 
 class CRISMER_BERT:
-    def __init__(self, scenario='ts1', weights_path=None, bins_weights_path=None, scaler_path=None, opti_th=None, ref_genome=None):
-        self.scenario = scenario
+    def __init__(self, scenario=None, weights_path=None, bins_weights_path=None, scaler_path=None, opti_th=None, ref_genome=None):
         self.proj_t = time.time()
         
+        # Automatically detect files in models directory if paths are not provided
+        detected_weights = None
+        detected_scaler = None
+        detected_bins_weights = None
+        detected_scenario = 'ts2'  # Default scenario if none detected
+        
+        models_dir = os.path.join(pwd, 'models')
+        if os.path.exists(models_dir) and os.path.isdir(models_dir):
+            for file in os.listdir(models_dir):
+                filepath = os.path.join(models_dir, file)
+                if not os.path.isfile(filepath):
+                    continue
+                # Identify weights file (.h5)
+                if file.endswith('.h5'):
+                    detected_weights = filepath
+                    if 'ts3' in file.lower():
+                        detected_scenario = 'ts3'
+                    elif 'ts1' in file.lower():
+                        detected_scenario = 'ts1'
+                    elif 'ts2' in file.lower():
+                        detected_scenario = 'ts2'
+                # Identify scaler file (.pkl)
+                elif 'scaler' in file.lower() and file.endswith('.pkl'):
+                    detected_scaler = filepath
+                # Identify bin weights file (.pkl)
+                elif 'bin' in file.lower() and file.endswith('.pkl'):
+                    detected_bins_weights = filepath
+
+        if not scenario:
+            self.scenario = detected_scenario
+        else:
+            self.scenario = scenario
+
+        if not weights_path:
+            weights_path = detected_weights
+            if not weights_path:
+                # Fallback to root directory
+                for sc in ['ts2', 'ts1', 'ts3']:
+                    p = os.path.join(pwd, f'crispr_bert_model_{sc}.h5')
+                    if os.path.exists(p):
+                        weights_path = p
+                        if not scenario:
+                            self.scenario = sc
+                        break
+            
+        if not scaler_path:
+            scaler_path = detected_scaler
+            if not scaler_path:
+                p = os.path.join(pwd, f'models/minmax_scaler_{self.scenario}.pkl')
+                if os.path.exists(p):
+                    scaler_path = p
+                else:
+                    p = os.path.join(pwd, 'models/minmax_scaler.pkl')
+                    if os.path.exists(p):
+                        scaler_path = p
+            
+        if not bins_weights_path:
+            bins_weights_path = detected_bins_weights
+            if not bins_weights_path:
+                p = os.path.join(pwd, f'models/bin_weights_{self.scenario}.pkl')
+                if os.path.exists(p):
+                    bins_weights_path = p
+                else:
+                    p = os.path.join(pwd, 'models/bin_weights.pkl')
+                    if os.path.exists(p):
+                        bins_weights_path = p
+
         if ref_genome is not None:
             self.ref_genome = ref_genome
         else:
@@ -24,7 +90,7 @@ class CRISMER_BERT:
             self.opti_th = 0.76
             
         # Dynamically import Encoder
-        if scenario == 'ts3':
+        if self.scenario == 'ts3':
             import Encoder_ts3 as enc
         else:
             import Encoder as enc
@@ -33,17 +99,12 @@ class CRISMER_BERT:
         # Load BERT model and weights
         from model_ts1 import build_bert
         self.model = build_bert()
+        
         if weights_path and os.path.exists(weights_path):
             print(f"Loading weights from {weights_path}...")
             self.model.load_weights(weights_path)
         else:
-            # Try default paths
-            default_weights = os.path.join(pwd, f'crispr_bert_model_{scenario}.h5')
-            if os.path.exists(default_weights):
-                print(f"Loading default weights from {default_weights}...")
-                self.model.load_weights(default_weights)
-            else:
-                print("Warning: No weights loaded. Model has random initialization.")
+            print("Warning: No weights loaded. Model has random initialization.")
                 
         # Try to load scaler
         if scaler_path and os.path.exists(scaler_path):
@@ -55,16 +116,7 @@ class CRISMER_BERT:
                 print(f"Warning: Could not load scaler from {scaler_path}: {e}")
                 self.scaler = None
         else:
-            default_scaler = os.path.join(pwd, f'models/minmax_scaler_{scenario}.pkl')
-            if os.path.exists(default_scaler):
-                import joblib
-                try:
-                    self.scaler = joblib.load(default_scaler)
-                    print(f"Loaded default scaler from {default_scaler}")
-                except Exception as e:
-                    self.scaler = None
-            else:
-                self.scaler = None
+            self.scaler = None
                 
         # Try to load bins and weights
         if bins_weights_path and os.path.exists(bins_weights_path):
@@ -78,19 +130,8 @@ class CRISMER_BERT:
                 self.bins = [0, 0.4, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.01]
                 self.prob_weight = np.array([0.0, 0.000255, 0.004813, 0.032304, 0.20901, 0.528241, 0.712388, 0.828807, 0.91069, 0.953488, 0.972763, 1.0])
         else:
-            default_bins_weights = os.path.join(pwd, f'models/bin_weights_{scenario}.pkl')
-            if os.path.exists(default_bins_weights):
-                import pickle
-                try:
-                    with open(default_bins_weights, 'rb') as f:
-                        self.bins, self.prob_weight = pickle.load(f)
-                    print(f"Loaded default bins and weights from {default_bins_weights}")
-                except Exception as e:
-                    self.bins = [0, 0.4, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.01]
-                    self.prob_weight = np.array([0.0, 0.000255, 0.004813, 0.032304, 0.20901, 0.528241, 0.712388, 0.828807, 0.91069, 0.953488, 0.972763, 1.0])
-            else:
-                self.bins = [0, 0.4, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.01]
-                self.prob_weight = np.array([0.0, 0.000255, 0.004813, 0.032304, 0.20901, 0.528241, 0.712388, 0.828807, 0.91069, 0.953488, 0.972763, 1.0])
+            self.bins = [0, 0.4, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.01]
+            self.prob_weight = np.array([0.0, 0.000255, 0.004813, 0.032304, 0.20901, 0.528241, 0.712388, 0.828807, 0.91069, 0.953488, 0.972763, 1.0])
 
     def prepare_bert_inputs(self, scored_df):
         pairs_data = []
