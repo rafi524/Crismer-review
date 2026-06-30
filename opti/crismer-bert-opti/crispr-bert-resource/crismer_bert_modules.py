@@ -97,7 +97,7 @@ class CRISMER_BERT:
         self.enc_module = enc
         
         # Load BERT model and weights
-        from model_ts1 import build_bert
+        from model_ts2 import build_bert
         self.model = build_bert()
         
         if weights_path and os.path.exists(weights_path):
