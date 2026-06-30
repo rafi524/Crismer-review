@@ -1,5 +1,17 @@
 import os
 import tensorflow as tf
+
+# Prevent TensorFlow from claiming all GPU memory upfront, so Cas-OFFinder's
+# OpenCL process can still allocate memory on the same GPU later.
+gpus = tf.config.experimental.list_physical_devices('GPU')
+for gpu in gpus:
+    try:
+        tf.config.experimental.set_memory_growth(gpu, True)
+    except RuntimeError as e:
+        # Must be set before GPUs have been initialized; harmless if this
+        # runs after a context already exists, but log it just in case.
+        print(f"Warning: could not set memory growth on {gpu}: {e}")
+
 from keras.callbacks import *
 from keras.layers import *
 from keras.models import Model
