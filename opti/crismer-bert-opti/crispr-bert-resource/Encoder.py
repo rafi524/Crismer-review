@@ -46,6 +46,7 @@ def BERT_encode(data):
 def C_RNN_encode(data):
     encode=[]
     for idx, row in data.iterrows():
+        print(row[0])
         en = Encoder(row[0])
         encode.append(en.on_off_code)
     return encode
