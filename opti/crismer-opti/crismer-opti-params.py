@@ -17,6 +17,21 @@ Pipeline
 4. Every artifact needed to regenerate a graph later (raw scores, labels,
    bin centers, active ratios) is pickled to disk — no need to rerun
    inference just to redraw a plot.
+
+Fixes applied vs. the original draft
+-------------------------------------
+- NameError: `run_calibration` referenced an undefined `CALIBRATION_T`.
+  It now correctly uses `CALIBRATION_WEIGHT_T`.
+- Off-by-one binning bug: `np.digitize(scores, bins, right=True)` mapped a
+  score of exactly 0.0 to bin index 0, but the aggregation loop only ever
+  checked `bin_indices == i + 1` for i in [0, num_bins). That silently
+  dropped any sample scoring exactly 0.0 from the active-ratio calculation.
+  Fixed by using `right=False` semantics correctly (`bins[i] <= score <
+  bins[i+1]`, with the final bin closed on the right) via
+  `np.clip(np.digitize(scores, bins[1:-1], right=False), 0, num_bins - 1)`.
+- `groupby(...).apply(..., include_groups=False)` uses a pandas>=2.2-only
+  kwarg and raises TypeError on older pandas. Made this version-safe with
+  a fallback.
 """
 
 import os
@@ -282,8 +297,8 @@ def load_model(model_path=MODEL_PATH, config=MODEL_CONFIG):
 # =============================================================================
 class TrainerDataset(Dataset):
     def __init__(self, inputs, targets):
-        self.inputs = torch.tensor(inputs, dtype=torch.float32).unsqueeze(1)
-        self.targets = torch.tensor(targets, dtype=torch.long)
+        self.inputs = torch.tensor(np.asarray(inputs), dtype=torch.float32).unsqueeze(1)
+        self.targets = torch.tensor(np.asarray(targets), dtype=torch.long)
 
     def __len__(self):
         return len(self.targets)
@@ -448,6 +463,7 @@ def one_hot_features(df):
     """Builds (n_samples, 20, 16) pairwise one-hot features from On/Off columns."""
     nucleotides = ["A", "T", "G", "C"]
     pairs = [f"{n1}{n2}" for n1 in nucleotides for n2 in nucleotides]
+    pair_to_idx = {p: i for i, p in enumerate(pairs)}
 
     pairwise_features = np.zeros((len(df), 20, len(pairs)))
 
@@ -455,11 +471,10 @@ def one_hot_features(df):
         on_seq = row["On"]
         off_seq = row["Off"]
 
-        for pos in range(20):
+        for pos in range(min(20, len(on_seq), len(off_seq))):
             pair = on_seq[pos] + off_seq[pos]
-            if pair in pairs:
-                pair_idx = pairs.index(pair)
-                pairwise_features[idx, pos, pair_idx] = 1
+            if pair in pair_to_idx:
+                pairwise_features[idx, pos, pair_to_idx[pair]] = 1
 
     return pairwise_features[:, :20, :]
 
@@ -469,17 +484,28 @@ def one_hot_features(df):
 # =============================================================================
 def compute_active_ratio_bins(scores, true_y, num_bins=NUM_BINS):
     """Bins scores into `num_bins` equal-width bins in [0, 1] and computes the
-    fraction of true positives ("active ratio") in each bin."""
+    fraction of true positives ("active ratio") in each bin.
+
+    Bin i covers [bins[i], bins[i+1]) for i < num_bins - 1, and the final
+    bin is closed on both ends: [bins[-2], bins[-1]]. This ensures a score
+    of exactly 0.0 lands in bin 0 and a score of exactly 1.0 lands in the
+    last bin, instead of being dropped.
+    """
     scores = np.array(scores)
     true_y = np.array(true_y)
 
     bins = np.linspace(0, 1, num_bins + 1)
-    bin_indices = np.digitize(scores, bins, right=True)
+    # np.digitize with the interior edges only, right=False, gives:
+    #   bin_indices[k] = i  such that bins[i] <= scores[k] < bins[i+1]
+    # and clipping keeps scores == 1.0 (or any float noise above 1.0) in the
+    # last bin instead of overflowing to num_bins.
+    bin_indices = np.digitize(scores, bins[1:-1], right=False)
+    bin_indices = np.clip(bin_indices, 0, num_bins - 1)
 
     bin_counts = np.zeros(num_bins)
     bin_positives = np.zeros(num_bins)
     for i in range(num_bins):
-        bin_mask = bin_indices == i + 1
+        bin_mask = bin_indices == i
         bin_counts[i] = np.sum(bin_mask)
         bin_positives[i] = np.sum(true_y[bin_mask])
 
@@ -503,7 +529,9 @@ def plot_active_ratio(bin_centers, active_ratios, num_bins=NUM_BINS, title=None,
         plt.title(title)
 
     if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        save_dir = os.path.dirname(save_path)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
         plt.savefig(save_path, dpi=300)
 
     plt.show()
@@ -530,23 +558,26 @@ def calculate_weights(scores, test_y, bins):
     Returns:
         pd.DataFrame: bin ranges, counts, and active ratios.
     """
-    data = pd.DataFrame({"score": scores, "Active": test_y})
+    data = pd.DataFrame({"score": np.asarray(scores), "Active": np.asarray(test_y)})
     data["bin"] = pd.cut(data["score"], bins=bins, include_lowest=True)
 
-    bin_stats = (
-        data.groupby("bin", observed=False)
-        .apply(
-            lambda x: pd.Series(
-                {
-                    "active_count": (x["Active"] == 1).sum(),
-                    "inactive_count": (x["Active"] == 0).sum(),
-                    "total_count": len(x),
-                }
-            ),
-            include_groups=False,
+    def _agg(x):
+        return pd.Series(
+            {
+                "active_count": (x["Active"] == 1).sum(),
+                "inactive_count": (x["Active"] == 0).sum(),
+                "total_count": len(x),
+            }
         )
-        .reset_index()
-    )
+
+    grouped = data.groupby("bin", observed=False)
+    try:
+        # pandas >= 2.2 supports include_groups; avoids a FutureWarning about
+        # the grouping columns being passed into the function.
+        bin_stats = grouped.apply(_agg, include_groups=False).reset_index()
+    except TypeError:
+        # Older pandas doesn't know about include_groups at all.
+        bin_stats = grouped.apply(_agg).reset_index()
 
     bin_stats["active_ratio"] = bin_stats["active_count"] / bin_stats["total_count"]
     bin_stats["active_ratio"] = bin_stats["active_ratio"].fillna(0)
@@ -645,17 +676,19 @@ def run_calibration(model):
     test_x = one_hot_features(df)
     test_y = df["Active"]
 
-    scores = getScore(model, test_x, test_y, T=CALIBRATION_T, scaler="softmax", fit_scaler=True)
+    scores = getScore(
+        model, test_x, test_y, T=CALIBRATION_WEIGHT_T, scaler="softmax", fit_scaler=True
+    )
 
     bin_centers, active_ratios = graphActiveRatio(
         scores,
         true_y=test_y,
         num_bins=NUM_BINS,
-        title=f"{CALIBRATION_NAME} (T={CALIBRATION_T})",
-        save_path=os.path.join(plots_path, f"{CALIBRATION_NAME}_T{CALIBRATION_T}.png"),
+        title=f"{CALIBRATION_NAME} (T={CALIBRATION_WEIGHT_T})",
+        save_path=os.path.join(plots_path, f"{CALIBRATION_NAME}_T{CALIBRATION_WEIGHT_T}.png"),
     )
 
-    save_graph_data(CALIBRATION_NAME, CALIBRATION_T, scores, test_y, bin_centers, active_ratios)
+    save_graph_data(CALIBRATION_NAME, CALIBRATION_WEIGHT_T, scores, test_y, bin_centers, active_ratios)
 
     wt = calculate_weights(scores, test_y, WEIGHT_BIN_EDGES)
     weights = wt["active_ratio"]
