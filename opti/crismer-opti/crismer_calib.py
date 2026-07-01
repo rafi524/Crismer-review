@@ -404,7 +404,7 @@ def apply_minmax(scaler, scores):
 # =============================================================================
 # 5. WEIGHT-BIN HELPER (used to save the two confidence-weight tables)
 # =============================================================================
-def calculate_weights(scores, test_y, bins):
+def calculate_weights(scores, test_y, bins, min_count=1):
     """
     Calculate weights (active ratios) for a binary classification problem.
 
@@ -412,9 +412,20 @@ def calculate_weights(scores, test_y, bins):
         scores: Predicted/scaled scores (expected in/near [0, 1]).
         test_y: True binary labels.
         bins (list): Bin edges for score ranges.
+        min_count: If a bin's total_count falls below this, its
+            active_ratio is set to NaN (not 0) and flagged in
+            `low_count_warning`, so "no/too little data in this bin" is
+            never silently indistinguishable from "confidently wrong in
+            this bin". Default of 1 preserves the old fillna(0) behavior
+            for genuinely empty bins (0/0 -> NaN either way) but stops
+            SMALL non-empty bins from being reported as 0.0 with no
+            indication of how few samples that's based on. Raise this
+            (e.g. 20-30) to also flag bins that are technically non-empty
+            but too sparse to trust.
 
     Returns:
-        pd.DataFrame: bin ranges, counts, and active ratios.
+        pd.DataFrame: bin ranges, counts, active ratios, and a
+            `low_count_warning` flag for bins under `min_count`.
     """
     data = pd.DataFrame({"score": np.asarray(scores), "Active": np.asarray(test_y)})
     data["bin"] = pd.cut(data["score"], bins=bins, include_lowest=True)
@@ -435,9 +446,164 @@ def calculate_weights(scores, test_y, bins):
         bin_stats = grouped.apply(_agg).reset_index()
 
     bin_stats["active_ratio"] = bin_stats["active_count"] / bin_stats["total_count"]
+    bin_stats["low_count_warning"] = bin_stats["total_count"] < min_count
+    # Only genuinely empty bins (total_count == 0) get NaN from the division
+    # itself; bins that are non-empty but below min_count KEEP their real
+    # ratio, they're just flagged, so the number in active_ratio is never
+    # fabricated -- low_count_warning is what tells you not to trust it.
     bin_stats["active_ratio"] = bin_stats["active_ratio"].fillna(0)
 
+    low_count_bins = bin_stats.loc[bin_stats["low_count_warning"], ["bin", "total_count", "active_ratio"]]
+    if len(low_count_bins) > 0:
+        print(
+            f"[calculate_weights] WARNING: {len(low_count_bins)} bin(s) have "
+            f"total_count < {min_count} -- their active_ratio is based on very "
+            f"little data and should not be read as a reliable precision estimate:"
+        )
+        print(low_count_bins.to_string(index=False))
+
     return bin_stats
+
+
+# =============================================================================
+# 5B. DIAGNOSTICS -- trace a suspicious bin back to the actual sites in it
+# =============================================================================
+# A bin's active_ratio being 0.0 (or unexpectedly low) has two very different
+# possible explanations: (1) too little data in the bin to mean anything, or
+# (2) the model is genuinely, confidently wrong on real sites in that bin.
+# These helpers make it possible to tell which one you're looking at instead
+# of guessing from the ratio alone. They also check for a third, pooling-
+# specific explanation: the same (On, Off) site appearing in more than one
+# of the four eval assays with DISAGREEING Active labels, which can make a
+# single site look like "the model confidently got this wrong" when it's
+# really "two assays disagree about this site's ground truth."
+
+
+def split_pooled_array_by_dataset(per_dataset, pooled_array):
+    """
+    Splits an array that was built by concatenating per_dataset[name]["scores"]
+    (in per_dataset's iteration order, i.e. EVAL_DATASETS order) back into
+    per-dataset slices. Used to recover which rescaled score belongs to
+    which assay/site after scores from all four datasets have been pooled
+    and MinMax-rescaled together.
+    """
+    pooled_array = np.asarray(pooled_array)
+    out = {}
+    offset = 0
+    for name, d in per_dataset.items():
+        n = len(d["scores"])
+        out[name] = pooled_array[offset : offset + n]
+        offset += n
+    return out
+
+
+def build_combined_diagnostic_table(per_dataset, scaled_scores_by_dataset):
+    """
+    Builds one long DataFrame (dataset, On, Off, Active, score_raw,
+    score_scaled) across all four eval assays, for tracing a bin's contents
+    back to actual sgRNA/off-target site pairs.
+    """
+    rows = []
+    for name, d in per_dataset.items():
+        rows.append(
+            pd.DataFrame(
+                {
+                    "dataset": name,
+                    "On": d["on"],
+                    "Off": d["off"],
+                    "Active": d["true_y"],
+                    "score_raw": d["scores"],
+                    "score_scaled": scaled_scores_by_dataset[name],
+                }
+            )
+        )
+    return pd.concat(rows, ignore_index=True)
+
+
+def find_cross_dataset_label_conflicts(combined):
+    """
+    Finds (On, Off) site pairs that appear more than once across the pooled
+    eval assays with DISAGREEING Active labels (e.g. Circle-seq calls a
+    site inactive, Guide-seq calls the same site active). Pooling assays
+    without resolving these means the model is being scored against two
+    contradictory ground-truth labels for the same input -- which can look
+    exactly like "the model is confidently wrong" at a high-score bin when
+    it's actually an assay-vs-assay labeling disagreement.
+    """
+    grouped = combined.groupby(["On", "Off"])["Active"].nunique()
+    conflicting_pairs = grouped[grouped > 1].index
+    if len(conflicting_pairs) == 0:
+        return combined.iloc[0:0].copy()
+    mask = combined.set_index(["On", "Off"]).index.isin(conflicting_pairs)
+    return combined[mask].sort_values(["On", "Off", "dataset"])
+
+
+def inspect_score_range(combined, low, high, score_col="score_scaled", top_n=None):
+    """
+    Returns the rows of `combined` with score_col in (low, high], sorted by
+    score descending, with a `label_conflict_elsewhere` column flagging any
+    (On, Off) pair that appears elsewhere in `combined` with a different
+    Active label. Use this to see EXACTLY which sites land in a suspicious
+    bin (e.g. the top-confidence bin with 0% empirical precision).
+    """
+    subset = combined[(combined[score_col] > low) & (combined[score_col] <= high)].copy()
+    subset = subset.sort_values(score_col, ascending=False)
+
+    conflicts = find_cross_dataset_label_conflicts(combined)
+    conflict_keys = set(zip(conflicts["On"], conflicts["Off"]))
+    subset["label_conflict_elsewhere"] = [
+        (on, off) in conflict_keys for on, off in zip(subset["On"], subset["Off"])
+    ]
+
+    if top_n is not None:
+        subset = subset.head(top_n)
+    return subset
+
+
+def diagnose_weight_bins(
+    per_dataset,
+    scaled_scores_by_dataset,
+    weight_table,
+    bin_edges=WEIGHT_BIN_EDGES,
+    flag_ratio_below=None,
+):
+    """
+    For every bin in `weight_table` with a suspicious active_ratio (0.0, or
+    below `flag_ratio_below` if given), prints the actual sites in that bin
+    plus whether any are cross-dataset label-conflict artifacts. Always
+    inspects the top (highest-score) bin specifically, since a low
+    precision result there is the most consequential for a deployed
+    threshold. Returns the combined per-site table and the conflict table
+    for further inspection.
+    """
+    combined = build_combined_diagnostic_table(per_dataset, scaled_scores_by_dataset)
+    conflicts = find_cross_dataset_label_conflicts(combined)
+
+    n_conflict_pairs = conflicts[["On", "Off"]].drop_duplicates().shape[0] if len(conflicts) else 0
+    print(
+        f"\n[diagnose_weight_bins] {len(conflicts)} site-rows involved in cross-dataset "
+        f"label conflicts ({n_conflict_pairs} unique (On, Off) pairs with disagreeing labels)."
+    )
+    if len(conflicts) > 0:
+        print(conflicts.to_string(index=False))
+
+    edges = list(bin_edges)
+    for i in range(len(edges) - 1):
+        low, high = edges[i], edges[i + 1]
+        row = weight_table.iloc[i]
+        is_top_bin = i == len(edges) - 2
+        suspicious = row["active_ratio"] == 0.0 or (
+            flag_ratio_below is not None and row["active_ratio"] < flag_ratio_below
+        )
+        if suspicious or is_top_bin:
+            tag = "TOP BIN" if is_top_bin else "LOW ACTIVE_RATIO"
+            print(
+                f"\n[diagnose_weight_bins] {tag}: bin ({low}, {high}] -- "
+                f"total_count={row['total_count']}, active_ratio={row['active_ratio']:.4f}"
+            )
+            print(inspect_score_range(combined, low, high).to_string(index=False))
+
+    return {"combined": combined, "label_conflicts": conflicts}
 
 
 # =============================================================================
@@ -527,6 +693,8 @@ def _score_eval_datasets(model, T=THRESHOLD_CV_T):
             "scores": np.asarray(scores),
             "true_y": test_y,
             "groups": df[SGRNA_GROUP_COLUMN].to_numpy(),
+            "on": df["On"].to_numpy(),
+            "off": df["Off"].to_numpy(),
         }
     return per_dataset
 
@@ -677,6 +845,11 @@ def run_pooled_sgRNA_kfold_threshold_cv(
         pickle.dump([WEIGHT_BIN_EDGES, weight_table["active_ratio"], deployment_scaler], f)
     print(f"[pooled_kfold] Saved confidence-weight bins + deployment scaler -> {POOLED_KFOLD_WEIGHTS_PATH}")
 
+    # Trace suspicious bins (especially the top bin) back to actual sites,
+    # and flag any that are cross-dataset label-conflict artifacts.
+    scaled_scores_by_dataset = split_pooled_array_by_dataset(per_dataset, scores_deployment_scaled)
+    diagnostics = diagnose_weight_bins(per_dataset, scaled_scores_by_dataset, weight_table)
+
     summary = {
         "scheme": "pooled_sgRNA_grouped_kfold",
         "k": k,
@@ -689,6 +862,7 @@ def run_pooled_sgRNA_kfold_threshold_cv(
         "weight_table": weight_table,
         "deployment_minmax_scaler": deployment_scaler,
         "dataset_composition": pd.Series(dataset_col).value_counts().to_dict(),
+        "bin_diagnostics": diagnostics,
     }
 
     os.makedirs(results_path, exist_ok=True)
@@ -819,6 +993,11 @@ def run_leave_one_dataset_out_threshold_cv(
         pickle.dump([WEIGHT_BIN_EDGES, weight_table["active_ratio"], deployment_scaler], f)
     print(f"[leave_one_out] Saved confidence-weight bins + deployment scaler -> {LODO_WEIGHTS_PATH}")
 
+    # Trace suspicious bins (especially the top bin) back to actual sites,
+    # and flag any that are cross-dataset label-conflict artifacts.
+    scaled_scores_by_dataset = split_pooled_array_by_dataset(per_dataset, all_scores_deployment_scaled)
+    diagnostics = diagnose_weight_bins(per_dataset, scaled_scores_by_dataset, weight_table)
+
     summary = {
         "scheme": "leave_one_dataset_out",
         "T": T,
@@ -829,6 +1008,7 @@ def run_leave_one_dataset_out_threshold_cv(
         "frozen_threshold_overall_precision": overall_precision,
         "weight_table": weight_table,
         "deployment_minmax_scaler": deployment_scaler,
+        "bin_diagnostics": diagnostics,
     }
 
     os.makedirs(results_path, exist_ok=True)
