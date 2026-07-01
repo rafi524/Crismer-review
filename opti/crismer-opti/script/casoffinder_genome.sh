@@ -10,5 +10,5 @@ echo "${genome}" >> .temp_${tm}_casoffinder.in
 echo "NNNNNNNNNNNNNNNNNNNNNGG" >> .temp_${tm}_casoffinder.in
 echo "${target}NNN ${MM}" >> .temp_${tm}_casoffinder.in
 cat .temp_${tm}_casoffinder.in
-./cas-offinder .temp_${tm}_casoffinder.in C .temp_${tm}_casoffinder.out
+./cas-offinder .temp_${tm}_casoffinder.in G .temp_${tm}_casoffinder.out
 rm .temp_${tm}_casoffinder.in
