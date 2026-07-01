@@ -546,6 +546,43 @@ def graphActiveRatio(scores, true_y, num_bins=NUM_BINS, title=None, save_path=No
     return bin_centers, active_ratios
 
 
+def find_min_bin_at_threshold(bin_centers, active_ratios, threshold=0.8):
+    """Returns the lowest score bin (by bin_center) whose active ratio is at
+    least `threshold`, along with that active ratio.
+
+    `bin_centers` and `active_ratios` are expected to be ascending-by-score,
+    aligned arrays (e.g. as returned by `compute_active_ratio_bins`, or the
+    "bin"/"active_ratio" columns produced by `calculate_weights`).
+
+    Returns:
+        (bin_center_or_interval, active_ratio) for the first qualifying bin,
+        or (None, None) if no bin reaches the threshold.
+    """
+    bin_centers = np.asarray(bin_centers, dtype=object)
+    active_ratios = np.asarray(active_ratios, dtype=float)
+
+    mask = active_ratios >= threshold
+    if not mask.any():
+        return None, None
+
+    idx = np.argmax(mask)  # first True, since inputs are ascending by score
+    return bin_centers[idx], active_ratios[idx]
+
+
+def print_min_bin_at_threshold(name, bin_centers, active_ratios, threshold=0.8):
+    """Convenience wrapper: computes and prints the minimum qualifying bin
+    for a given (dataset, T) active-ratio result."""
+    bin_val, ratio = find_min_bin_at_threshold(bin_centers, active_ratios, threshold)
+    if bin_val is None:
+        print(f"[{name}] No score bin reaches an active ratio >= {threshold:.0%}.")
+    else:
+        print(
+            f"[{name}] Minimum score bin with active ratio >= {threshold:.0%}: "
+            f"{bin_val} (active ratio = {ratio:.4f})"
+        )
+    return bin_val, ratio
+
+
 def calculate_weights(scores, test_y, bins):
     """
     Calculate weights (active ratios) for a binary classification problem.
@@ -690,6 +727,10 @@ def run_calibration(model):
 
     save_graph_data(CALIBRATION_NAME, CALIBRATION_WEIGHT_T, scores, test_y, bin_centers, active_ratios)
 
+    print_min_bin_at_threshold(
+        f"{CALIBRATION_NAME} (T={CALIBRATION_WEIGHT_T})", bin_centers, active_ratios, threshold=0.8
+    )
+
     wt = calculate_weights(scores, test_y, WEIGHT_BIN_EDGES)
     weights = wt["active_ratio"]
     print(WEIGHT_BIN_EDGES)
@@ -734,6 +775,11 @@ def run_eval_datasets(model):
             )
 
             save_graph_data(name, T, scores, test_y, bin_centers, active_ratios)
+
+            print_min_bin_at_threshold(
+                f"{name} (T={T})", bin_centers, active_ratios, threshold=0.8
+            )
+
             results[(name, T)] = {"scores": scores, "true_y": test_y}
 
     return results
