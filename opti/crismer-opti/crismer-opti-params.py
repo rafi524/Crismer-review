@@ -49,7 +49,7 @@ from sklearn.preprocessing import MinMaxScaler, StandardScaler
 SEED = 12345
 
 # Root folder that holds the raw dataset CSVs.
-base_data_path = "../"
+base_data_path = "../dataset"
 
 # Root folder that holds model weights, scalers, and all pickled artifacts.
 base_model_path = "models/"
