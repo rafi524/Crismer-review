@@ -80,8 +80,7 @@ MODEL_CONFIG = {
 # Datasets combined ONLY to fit the scaler + calibrate the confidence-weight
 # bins (T = 10). Kept separate from the four independently-evaluated sets.
 CALIBRATION_DATASETS = {
-    "Change-seq": os.path.join(base_data_path, "changeseq.csv"),
-    "Site-seq": os.path.join(base_data_path, "siteseq.csv"),
+    "Change-seq": os.path.join(base_data_path, "changeseq_siteseq.csv"),
 }
 CALIBRATION_NAME = "changeseq_siteseq"
 CALIBRATION_T_VALUES = [1, 5, 10]
