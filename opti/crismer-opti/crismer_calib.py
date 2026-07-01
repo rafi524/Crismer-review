@@ -4,31 +4,53 @@ CRISMER-BERT / CRISPR-Transformer — Non-Circular Threshold Selection
 =====================================================================
 Stripped-down version: NO calibration step on Change-seq + Site-seq. The
 model's already-trained weights are used as-is; scores are plain softmax
-probabilities at a fixed temperature (THRESHOLD_CV_T). Everything here
-operates ONLY on the four independent evaluation assays (Circle-seq,
-Guide-seq, Surro-seq, TTISS) — never on the training data — so the
-threshold is never justified using the same samples it's evaluated on.
+probabilities at a fixed temperature (THRESHOLD_CV_T), RESCALED to [0, 1]
+with a per-fold MinMax transform to undo the compression that a high
+temperature introduces (see note below). Everything here operates ONLY on
+the four independent evaluation assays (Circle-seq, Guide-seq, Surro-seq,
+TTISS) — never on the training data — so the threshold is never justified
+using the same samples it's evaluated on.
+
+WHY THE MINMAX STEP: softmax(logits / T) with T=10 divides logits by a
+large constant before exponentiating, which shrinks the gaps between
+classes and pulls every score toward ~0.5. Left alone, this compression
+makes `TARGET_PRECISION` threshold search noisy (all the signal is
+squeezed into a tiny slice of [0, 1]) and makes WEIGHT_BIN_EDGES, which
+assumes scores actually span [0, 1], meaningless. A MinMax rescale
+stretches the compressed scores back out to [0, 1] using only the
+min/max observed in that fit's data.
+
+To keep this non-circular, the MinMax scaler is ALWAYS fit only on the
+calibration/pool side of a split and then applied (with clipping) to the
+held-out side — the holdout never influences its own rescaling. A single
+"deployment" scaler, fit once on the full pooled eval set, is saved
+alongside the frozen threshold and weight-bin table for use at inference
+time on new data.
 
 Two threshold-selection schemes, run independently, each producing its own
-frozen threshold and its own confidence-weight bin table:
+frozen threshold, its own fitted deployment MinMax scaler, and its own
+confidence-weight bin table:
 
   (a) run_pooled_sgRNA_kfold_threshold_cv
       Pools all four eval datasets, groups by sgRNA (so a guide's off-target
       sites never span the calibration/holdout split of a fold), and rotates
-      POOLED_KFOLD_SPLITS folds (default 8). For each fold: pick the min
-      score threshold hitting TARGET_PRECISION on the calibration portion,
-      then check precision on the truly-unseen holdout portion.
+      POOLED_KFOLD_SPLITS folds (default 8). For each fold: fit a MinMax
+      scaler on the calibration portion, rescale both sides with it, pick
+      the min rescaled-score threshold hitting TARGET_PRECISION on
+      calibration, then check precision on the truly-unseen rescaled
+      holdout.
 
   (b) run_leave_one_dataset_out_threshold_cv
       Pools 3 of the 4 assays to pick a threshold, validates on the 4th
-      (an entirely unseen assay technology), rotates through all 4.
-      Optionally excludes any sgRNA that overlaps between the held-out
-      assay and the calibration pool, to avoid a guide informing both
-      sides of the split.
+      (an entirely unseen assay technology), rotates through all 4. The
+      MinMax scaler for each fold is fit on the pooled 3-assay calibration
+      side only and applied to the 4th (holdout) assay. Optionally excludes
+      any sgRNA that overlaps between the held-out assay and the
+      calibration pool, to avoid a guide informing both sides of the split.
 
 Both report per-fold/per-assay thresholds (stability), the mean/std frozen
 threshold, and the precision of that frozen threshold on the pooled
-out-of-fold data.
+out-of-fold data (all computed in each fold's own rescaled score space).
 """
 
 import os
@@ -46,6 +68,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from sklearn.metrics import precision_recall_curve
 from sklearn.model_selection import GroupKFold
+from sklearn.preprocessing import MinMaxScaler
 
 
 # =============================================================================
@@ -86,6 +109,9 @@ EVAL_DATASETS = {
 WEIGHT_BIN_EDGES = [0, 0.4, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.01]
 
 # Fixed softmax temperature used for every score computed in this script.
+# NOTE: T=10 compresses softmax(logits / T) toward ~0.5; that's exactly why
+# every threshold/weight-table step below rescales with a MinMax fit only
+# on the calibration/pool side of its split (see module docstring).
 THRESHOLD_CV_T = 10
 
 # Target precision for "min confidence threshold at X% precision".
@@ -314,10 +340,13 @@ def tester(model, test_x, test_y, batch_size=128):
 
 def get_confidence_scores(model, test_x, test_y, T=THRESHOLD_CV_T):
     """
-    Runs inference and returns softmax(logits / T)[:, 1] as the confidence
-    score for the "active" class. No MinMax/Standard rescaling and no
-    Change-seq/Site-seq calibration step — scores are used exactly as the
-    trained model + temperature produce them.
+    Runs inference and returns RAW softmax(logits / T)[:, 1] as the
+    confidence score for the "active" class. No rescaling happens here —
+    this function stays a pure model-forward-pass. Because T is large,
+    these raw scores are compressed toward ~0.5; the MinMax rescaling that
+    corrects for that is applied downstream, per-fold, on calibration data
+    only (see `_fit_minmax` / the CV functions below), never here, so this
+    function can't accidentally leak holdout information into a scaler.
     """
     _, results = tester(model, test_x, test_y)
     predictions = [torch.nn.functional.softmax(r / T, dim=0) for r in results]
@@ -346,14 +375,41 @@ def one_hot_features(df):
 
 
 # =============================================================================
-# 4. WEIGHT-BIN HELPER (used to save the two confidence-weight tables)
+# 4. MINMAX RESCALING HELPER (undoes high-T softmax compression, per-fold)
+# =============================================================================
+def fit_minmax_on_calibration(calib_scores):
+    """
+    Fits a MinMaxScaler using ONLY calibration/pool scores. This is the one
+    and only place a scaler is ever fit in this script, and it never sees
+    holdout data — keeping the rescale step as non-circular as the
+    threshold search itself.
+    """
+    scaler = MinMaxScaler()
+    scaler.fit(np.asarray(calib_scores, dtype=float).reshape(-1, 1))
+    return scaler
+
+
+def apply_minmax(scaler, scores):
+    """
+    Applies an already-fit MinMaxScaler to `scores` and clips to [0, 1].
+    Clipping matters because a holdout fold can contain scores outside the
+    calibration fold's observed min/max; without clipping those samples
+    would land outside [0, 1] and break WEIGHT_BIN_EDGES / precision logic
+    downstream.
+    """
+    scaled = scaler.transform(np.asarray(scores, dtype=float).reshape(-1, 1)).ravel()
+    return np.clip(scaled, 0.0, 1.0)
+
+
+# =============================================================================
+# 5. WEIGHT-BIN HELPER (used to save the two confidence-weight tables)
 # =============================================================================
 def calculate_weights(scores, test_y, bins):
     """
     Calculate weights (active ratios) for a binary classification problem.
 
     Args:
-        scores: Predicted/scaled scores.
+        scores: Predicted/scaled scores (expected in/near [0, 1]).
         test_y: True binary labels.
         bins (list): Bin edges for score ranges.
 
@@ -385,7 +441,7 @@ def calculate_weights(scores, test_y, bins):
 
 
 # =============================================================================
-# 5. DATA LOADING
+# 6. DATA LOADING
 # =============================================================================
 def load_single(path):
     """Reads a single dataset CSV, keeping On/Off/Active and dropping
@@ -396,12 +452,12 @@ def load_single(path):
 
 
 # =============================================================================
-# 6. THRESHOLD-STABILITY CROSS-VALIDATION  (fixes the circularity comment)
+# 7. THRESHOLD-STABILITY CROSS-VALIDATION  (fixes the circularity comment)
 # =============================================================================
 # Both schemes below operate ONLY on the four independent EVAL_DATASETS
 # (Circle-seq, Guide-seq, Surro-seq, TTISS) — no training/calibration data
 # is used anywhere — and never use the same samples to both pick and
-# validate a threshold.
+# validate a threshold, or to both fit and apply a MinMax rescale.
 
 
 def find_threshold_for_precision(scores, true_y, target_precision=TARGET_PRECISION):
@@ -451,11 +507,15 @@ def precision_at_threshold(scores, true_y, threshold):
 
 
 def _score_eval_datasets(model, T=THRESHOLD_CV_T):
-    """Loads each of the four EVAL_DATASETS, scores them at temperature T,
-    and returns a dict keyed by dataset name -> {"scores", "true_y", "groups"}.
+    """Loads each of the four EVAL_DATASETS, scores them (RAW, unscaled) at
+    temperature T, and returns a dict keyed by dataset name ->
+    {"scores", "true_y", "groups"}.
 
     `groups` is the sgRNA id (SGRNA_GROUP_COLUMN) used to prevent a guide's
     sites from being split across calibration/holdout in the pooled scheme.
+
+    Scores here are intentionally left un-rescaled: MinMax fitting happens
+    per-fold, downstream, on calibration data only.
     """
     per_dataset = {}
     for name, path in EVAL_DATASETS.items():
@@ -483,7 +543,7 @@ def plot_threshold_stability(labels, thresholds, title, save_path=None):
         plt.axhline(mean_t, color="red", linestyle="--", label=f"mean = {mean_t:.3f}")
         plt.legend()
     plt.xticks(x, labels, rotation=45, ha="right")
-    plt.ylabel("Selected threshold")
+    plt.ylabel("Selected threshold (MinMax-rescaled)")
     plt.title(title)
     plt.tight_layout()
     if save_path:
@@ -507,14 +567,22 @@ def run_pooled_sgRNA_kfold_threshold_cv(
     calibration/holdout split, and rotate `k` folds (8-10 recommended).
 
     For each fold:
-      - (k-1)/k of the pooled data ("calibration" portion) is used to find
-        the minimum score threshold hitting `target_precision`.
-      - The held-out 1/k portion (never used to pick that fold's threshold)
-        is used to check the empirical precision at that threshold.
+      - Raw scores on the (k-1)/k calibration portion are used to fit a
+        MinMax scaler (undoing the high-T softmax compression), which is
+        then applied to BOTH the calibration scores and the held-out 1/k
+        holdout scores (clipped to [0, 1]).
+      - The minimum rescaled threshold hitting `target_precision` is
+        picked on the rescaled calibration portion.
+      - The rescaled held-out portion (never used to fit that fold's
+        scaler or pick that fold's threshold) is used to check empirical
+        precision at that threshold.
 
     Reports per-fold thresholds (stability), the mean/std frozen threshold,
-    and the precision of the mean frozen threshold evaluated on the full
-    out-of-fold pool. Saves a dedicated confidence-weight bin table.
+    and the precision of the mean frozen threshold evaluated on the pooled
+    out-of-fold data (each in its own fold's rescaled space). At the end, a
+    single deployment MinMax scaler is fit on the FULL pooled raw score set
+    and saved alongside the frozen threshold and weight-bin table, for use
+    on new data going forward.
     """
     per_dataset = _score_eval_datasets(model, T=T)
 
@@ -526,7 +594,7 @@ def run_pooled_sgRNA_kfold_threshold_cv(
         y_list.append(d["true_y"])
         group_list.append(d["groups"])
 
-    scores = np.concatenate(scores_list)
+    scores = np.concatenate(scores_list)  # RAW scores, pre-rescale
     true_y = np.concatenate(y_list)
     groups = np.concatenate(group_list)
     dataset_col = np.array(dataset_col)
@@ -542,12 +610,16 @@ def run_pooled_sgRNA_kfold_threshold_cv(
     gkf = GroupKFold(n_splits=k)
 
     fold_records = []
-    oof_scores = np.full_like(scores, fill_value=np.nan, dtype=float)
-    oof_assigned = np.zeros(len(scores), dtype=bool)
+    oof_scores_scaled = np.full_like(scores, fill_value=np.nan, dtype=float)
 
     for fold_idx, (calib_idx, holdout_idx) in enumerate(gkf.split(scores, true_y, groups=groups)):
-        calib_scores, calib_y = scores[calib_idx], true_y[calib_idx]
-        holdout_scores, holdout_y = scores[holdout_idx], true_y[holdout_idx]
+        calib_scores_raw, calib_y = scores[calib_idx], true_y[calib_idx]
+        holdout_scores_raw, holdout_y = scores[holdout_idx], true_y[holdout_idx]
+
+        # Fit MinMax on calibration ONLY, then apply to both sides.
+        fold_scaler = fit_minmax_on_calibration(calib_scores_raw)
+        calib_scores = apply_minmax(fold_scaler, calib_scores_raw)
+        holdout_scores = apply_minmax(fold_scaler, holdout_scores_raw)
 
         thr = find_threshold_for_precision(calib_scores, calib_y, target_precision)
         holdout_precision = precision_at_threshold(holdout_scores, holdout_y, thr)
@@ -556,6 +628,8 @@ def run_pooled_sgRNA_kfold_threshold_cv(
             {
                 "fold": fold_idx,
                 "threshold": thr,
+                "scaler_calib_min": float(fold_scaler.data_min_[0]),
+                "scaler_calib_max": float(fold_scaler.data_max_[0]),
                 "n_calibration_sites": len(calib_idx),
                 "n_holdout_sites": len(holdout_idx),
                 "n_holdout_groups": len(np.unique(groups[holdout_idx])),
@@ -563,11 +637,11 @@ def run_pooled_sgRNA_kfold_threshold_cv(
             }
         )
 
-        oof_scores[holdout_idx] = holdout_scores
-        oof_assigned[holdout_idx] = True
+        oof_scores_scaled[holdout_idx] = holdout_scores
 
         print(
-            f"[pooled_kfold] fold {fold_idx}: threshold={thr}, "
+            f"[pooled_kfold] fold {fold_idx}: threshold={thr} "
+            f"(calib raw range [{fold_scaler.data_min_[0]:.4f}, {fold_scaler.data_max_[0]:.4f}]), "
             f"holdout_precision={holdout_precision}"
         )
 
@@ -576,7 +650,9 @@ def run_pooled_sgRNA_kfold_threshold_cv(
     mean_threshold = float(np.mean(valid_thresholds)) if len(valid_thresholds) else None
     std_threshold = float(np.std(valid_thresholds)) if len(valid_thresholds) else None
 
-    overall_precision = precision_at_threshold(scores, true_y, mean_threshold)
+    # Overall out-of-fold precision, computed entirely in each sample's own
+    # fold-rescaled space (every sample appears in exactly one holdout fold).
+    overall_precision = precision_at_threshold(oof_scores_scaled, true_y, mean_threshold)
 
     print("\n[pooled_kfold] Per-fold thresholds:", fold_df["threshold"].tolist())
     print(f"[pooled_kfold] Mean threshold = {mean_threshold}, std = {std_threshold}")
@@ -589,11 +665,17 @@ def run_pooled_sgRNA_kfold_threshold_cv(
         save_path=os.path.join(plots_path, "pooled_kfold_threshold_stability.png"),
     )
 
-    weight_table = calculate_weights(scores, true_y, WEIGHT_BIN_EDGES)
+    # Deployment scaler: fit once on the FULL pooled raw score set (this is
+    # not a "fold" being evaluated — it's the transform saved for scoring
+    # brand-new data at inference time) and use it to build the weight table.
+    deployment_scaler = fit_minmax_on_calibration(scores)
+    scores_deployment_scaled = apply_minmax(deployment_scaler, scores)
+
+    weight_table = calculate_weights(scores_deployment_scaled, true_y, WEIGHT_BIN_EDGES)
     os.makedirs(base_model_path, exist_ok=True)
     with open(POOLED_KFOLD_WEIGHTS_PATH, "wb") as f:
-        pickle.dump([WEIGHT_BIN_EDGES, weight_table["active_ratio"]], f)
-    print(f"[pooled_kfold] Saved confidence-weight bins -> {POOLED_KFOLD_WEIGHTS_PATH}")
+        pickle.dump([WEIGHT_BIN_EDGES, weight_table["active_ratio"], deployment_scaler], f)
+    print(f"[pooled_kfold] Saved confidence-weight bins + deployment scaler -> {POOLED_KFOLD_WEIGHTS_PATH}")
 
     summary = {
         "scheme": "pooled_sgRNA_grouped_kfold",
@@ -605,6 +687,7 @@ def run_pooled_sgRNA_kfold_threshold_cv(
         "std_threshold": std_threshold,
         "frozen_threshold_overall_precision": overall_precision,
         "weight_table": weight_table,
+        "deployment_minmax_scaler": deployment_scaler,
         "dataset_composition": pd.Series(dataset_col).value_counts().to_dict(),
     }
 
@@ -626,24 +709,29 @@ def run_leave_one_dataset_out_threshold_cv(
     Scheme (b): Leave-one-dataset-out CV across the four independent assays.
 
     For each of Circle-seq / Guide-seq / Surro-seq / TTISS:
-      - Pool the OTHER three datasets to find the minimum score threshold
-        hitting `target_precision`.
-      - Validate that threshold on the held-out dataset (an entire unseen
-        assay technology the threshold never saw).
+      - Pool the OTHER three datasets' raw scores, fit a MinMax scaler on
+        that pool ONLY, and rescale both the pool and the held-out dataset
+        with it (clipped to [0, 1]).
+      - Find the minimum rescaled-score threshold hitting `target_precision`
+        on the rescaled pool.
+      - Validate that threshold on the rescaled held-out dataset (an entire
+        unseen assay technology the threshold — and the scaler — never saw).
 
     If `exclude_overlapping_sgRNAs` is True, any sgRNA present in BOTH the
     held-out dataset and the calibration pool is dropped from the
-    calibration pool for that fold, to avoid the same guide informing both
-    sides of the split.
+    calibration pool for that fold (before fitting the scaler or the
+    threshold), to avoid the same guide informing both sides of the split.
 
     Reports the 4 per-assay thresholds (stability across assays), mean/std,
-    and precision of the frozen mean threshold on the full pooled set. Saves
-    a dedicated confidence-weight bin table.
+    and precision of the frozen mean threshold on the full pooled set
+    (rescaled with a deployment scaler fit on all four assays). Saves a
+    dedicated confidence-weight bin table plus that deployment scaler.
     """
     per_dataset = _score_eval_datasets(model, T=T)
     names = list(per_dataset.keys())
 
     fold_records = []
+    holdout_scores_scaled_by_name = {}
 
     for held_out in names:
         calib_names = [n for n in names if n != held_out]
@@ -662,11 +750,17 @@ def run_leave_one_dataset_out_threshold_cv(
             calib_scores_parts.append(d["scores"][mask])
             calib_y_parts.append(d["true_y"][mask])
 
-        calib_scores = np.concatenate(calib_scores_parts)
+        calib_scores_raw = np.concatenate(calib_scores_parts)
         calib_y = np.concatenate(calib_y_parts)
 
-        holdout_scores = per_dataset[held_out]["scores"]
+        holdout_scores_raw = per_dataset[held_out]["scores"]
         holdout_y = per_dataset[held_out]["true_y"]
+
+        # Fit MinMax on the pooled calibration side ONLY.
+        fold_scaler = fit_minmax_on_calibration(calib_scores_raw)
+        calib_scores = apply_minmax(fold_scaler, calib_scores_raw)
+        holdout_scores = apply_minmax(fold_scaler, holdout_scores_raw)
+        holdout_scores_scaled_by_name[held_out] = holdout_scores
 
         thr = find_threshold_for_precision(calib_scores, calib_y, target_precision)
         holdout_precision = precision_at_threshold(holdout_scores, holdout_y, thr)
@@ -676,6 +770,8 @@ def run_leave_one_dataset_out_threshold_cv(
                 "held_out_dataset": held_out,
                 "calibration_datasets": ",".join(calib_names),
                 "threshold": thr,
+                "scaler_calib_min": float(fold_scaler.data_min_[0]),
+                "scaler_calib_max": float(fold_scaler.data_max_[0]),
                 "n_calibration_sites": len(calib_y),
                 "n_excluded_overlapping_sgRNA_sites": n_excluded,
                 "n_holdout_sites": len(holdout_y),
@@ -684,7 +780,8 @@ def run_leave_one_dataset_out_threshold_cv(
         )
 
         print(
-            f"[leave_one_out] held out {held_out}: threshold={thr}, "
+            f"[leave_one_out] held out {held_out}: threshold={thr} "
+            f"(calib raw range [{fold_scaler.data_min_[0]:.4f}, {fold_scaler.data_max_[0]:.4f}]), "
             f"holdout_precision={holdout_precision}, excluded_overlap_sites={n_excluded}"
         )
 
@@ -693,9 +790,11 @@ def run_leave_one_dataset_out_threshold_cv(
     mean_threshold = float(np.mean(valid_thresholds)) if len(valid_thresholds) else None
     std_threshold = float(np.std(valid_thresholds)) if len(valid_thresholds) else None
 
-    all_scores = np.concatenate([per_dataset[n]["scores"] for n in names])
+    # Overall precision: each assay's holdout scores, each rescaled by that
+    # assay's own fold scaler (fit on the other three), pooled together.
+    all_scores_scaled = np.concatenate([holdout_scores_scaled_by_name[n] for n in names])
     all_y = np.concatenate([per_dataset[n]["true_y"] for n in names])
-    overall_precision = precision_at_threshold(all_scores, all_y, mean_threshold)
+    overall_precision = precision_at_threshold(all_scores_scaled, all_y, mean_threshold)
 
     print("\n[leave_one_out] Per-assay thresholds:", fold_df["threshold"].tolist())
     print(f"[leave_one_out] Mean threshold = {mean_threshold}, std = {std_threshold}")
@@ -708,11 +807,17 @@ def run_leave_one_dataset_out_threshold_cv(
         save_path=os.path.join(plots_path, "leave_one_dataset_out_threshold_stability.png"),
     )
 
-    weight_table = calculate_weights(all_scores, all_y, WEIGHT_BIN_EDGES)
+    # Deployment scaler: fit once on ALL FOUR pooled raw scores (again, this
+    # is the saved transform for future/new data, not a held-out fold).
+    all_scores_raw = np.concatenate([per_dataset[n]["scores"] for n in names])
+    deployment_scaler = fit_minmax_on_calibration(all_scores_raw)
+    all_scores_deployment_scaled = apply_minmax(deployment_scaler, all_scores_raw)
+
+    weight_table = calculate_weights(all_scores_deployment_scaled, all_y, WEIGHT_BIN_EDGES)
     os.makedirs(base_model_path, exist_ok=True)
     with open(LODO_WEIGHTS_PATH, "wb") as f:
-        pickle.dump([WEIGHT_BIN_EDGES, weight_table["active_ratio"]], f)
-    print(f"[leave_one_out] Saved confidence-weight bins -> {LODO_WEIGHTS_PATH}")
+        pickle.dump([WEIGHT_BIN_EDGES, weight_table["active_ratio"], deployment_scaler], f)
+    print(f"[leave_one_out] Saved confidence-weight bins + deployment scaler -> {LODO_WEIGHTS_PATH}")
 
     summary = {
         "scheme": "leave_one_dataset_out",
@@ -723,6 +828,7 @@ def run_leave_one_dataset_out_threshold_cv(
         "std_threshold": std_threshold,
         "frozen_threshold_overall_precision": overall_precision,
         "weight_table": weight_table,
+        "deployment_minmax_scaler": deployment_scaler,
     }
 
     os.makedirs(results_path, exist_ok=True)
@@ -736,7 +842,8 @@ def run_leave_one_dataset_out_threshold_cv(
 def run_threshold_cv_experiments(model):
     """Runs BOTH threshold-stability CV schemes and prints a short combined
     comparison at the end (do the two independently-derived thresholds
-    agree?)."""
+    agree? -- note both are on their own MinMax-rescaled [0, 1] score
+    space, so the numbers are directly comparable to each other)."""
     pooled_summary = run_pooled_sgRNA_kfold_threshold_cv(model)
     lodo_summary = run_leave_one_dataset_out_threshold_cv(model)
 
@@ -764,7 +871,7 @@ def run_threshold_cv_experiments(model):
 
 
 # =============================================================================
-# 7. MAIN
+# 8. MAIN
 # =============================================================================
 def main():
     set_seed()
